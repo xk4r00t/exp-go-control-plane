@@ -15,8 +15,14 @@
 package example
 
 import (
+	"bytes"
+	"encoding/json"
+	"os"
 	"time"
 
+	"go.yaml.in/yaml/v3"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 
@@ -25,11 +31,16 @@ import (
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	basicauth "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/basic_auth/v3"
 	router "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/resource/v3"
+
+	// Register the "@type" values used in the YAML file so protojson can decode them.
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 )
 
 const (
@@ -39,6 +50,10 @@ const (
 	ListenerPort = 10000
 	UpstreamHost = "www.envoyproxy.io"
 	UpstreamPort = 80
+
+	// Paths are relative to the go-control-plane root.
+	SourceFile = "../out/control-plane complex.fixed.yaml" // the data to serve
+	ConfigFile = "internal/config/config.yaml"             // the final config, rewritten on every push
 )
 
 func makeCluster(clusterName string) *cluster.Cluster {
@@ -77,13 +92,14 @@ func makeEndpoint(clusterName string) *endpoint.ClusterLoadAssignment {
 	}
 }
 
-func makeRoute(routeName, clusterName string) *route.RouteConfiguration {
+// makeRoute puts the given routes first; the example's catch-all "/" stays last.
+func makeRoute(routeName, clusterName string, routes ...*route.Route) *route.RouteConfiguration {
 	return &route.RouteConfiguration{
 		Name: routeName,
 		VirtualHosts: []*route.VirtualHost{{
 			Name:    "local_service",
 			Domains: []string{"*"},
-			Routes: []*route.Route{{
+			Routes: append(routes, &route.Route{
 				Match: &route.RouteMatch{
 					PathSpecifier: &route.RouteMatch_Prefix{
 						Prefix: "/",
@@ -99,13 +115,18 @@ func makeRoute(routeName, clusterName string) *route.RouteConfiguration {
 						},
 					},
 				},
-			}},
+			}),
 		}},
 	}
 }
 
 func makeHTTPListener(listenerName, route string) *listener.Listener {
 	routerConfig, _ := anypb.New(&router.Router{})
+	// basic_auth is off by default; a route's BasicAuthPerRoute turns it on with its own users.
+	// Envoy rejects an empty user list, so this one holds a placeholder.
+	basicAuthConfig, _ := anypb.New(&basicauth.BasicAuth{Users: &core.DataSource{
+		Specifier: &core.DataSource_InlineString{InlineString: "unused:{SHA}znUBAH8EplKeZQ8fGz/AWG0dlOs="},
+	}})
 	// HTTP filter configuration
 	manager := &hcm.HttpConnectionManager{
 		CodecType:  hcm.HttpConnectionManager_AUTO,
@@ -117,6 +138,10 @@ func makeHTTPListener(listenerName, route string) *listener.Listener {
 			},
 		},
 		HttpFilters: []*hcm.HttpFilter{{
+			Name:       "envoy.filters.http.basic_auth",
+			Disabled:   true,
+			ConfigType: &hcm.HttpFilter_TypedConfig{TypedConfig: basicAuthConfig},
+		}, {
 			Name:       "http-router",
 			ConfigType: &hcm.HttpFilter_TypedConfig{TypedConfig: routerConfig},
 		}},
@@ -168,13 +193,99 @@ func makeConfigSource() *core.ConfigSource {
 	return source
 }
 
-func GenerateSnapshot() *cache.Snapshot {
-	snap, _ := cache.NewSnapshot("1",
+// GenerateSnapshot adds the routes, clusters, listeners and endpoints of SourceFile to the example's own.
+func GenerateSnapshot(version string) (*cache.Snapshot, error) {
+	f, err := loadFile()
+	if err != nil {
+		return nil, err
+	}
+	return cache.NewSnapshot(version,
 		map[resource.Type][]types.Resource{
-			resource.ClusterType:  {makeCluster(ClusterName)},
-			resource.RouteType:    {makeRoute(RouteName, ClusterName)},
-			resource.ListenerType: {makeHTTPListener(ListenerName, RouteName)},
+			resource.ClusterType:  append(f.clusters, makeCluster(ClusterName)),
+			resource.RouteType:    {makeRoute(RouteName, ClusterName, f.routes...)},
+			resource.ListenerType: append(f.listeners, makeHTTPListener(ListenerName, RouteName)),
+			resource.EndpointType: f.endpoints,
 		},
 	)
-	return snap
+}
+
+// fileResources are the four lists read from SourceFile.
+type fileResources struct {
+	routes    []*route.Route
+	clusters  []types.Resource
+	listeners []types.Resource
+	endpoints []types.Resource // upstream hosts of EDS clusters
+}
+
+// loadFile reads SourceFile, overwrites ConfigFile with it, and decodes each list into Envoy protos.
+func loadFile() (fileResources, error) {
+	var f fileResources
+	var in struct {
+		Routes    []any `yaml:"routes"`
+		Clusters  []any `yaml:"clusters"`
+		Listeners []any `yaml:"listeners"`
+		Endpoints []any `yaml:"endpoints"`
+	}
+	raw, err := os.ReadFile(SourceFile)
+	if err != nil {
+		return f, err
+	}
+	if err := yaml.Unmarshal(raw, &in); err != nil {
+		return f, err
+	}
+
+	// The final config: the four lists, empty ones as [].
+	var out bytes.Buffer
+	enc := yaml.NewEncoder(&out)
+	enc.SetIndent(2)
+	if err := enc.Encode(in); err != nil {
+		return f, err
+	}
+	if err := os.WriteFile(ConfigFile, out.Bytes(), 0o644); err != nil {
+		return f, err
+	}
+
+	for _, item := range in.Routes {
+		r := &route.Route{}
+		if err := decode(item, r); err != nil {
+			return f, err
+		}
+		if err := r.ValidateAll(); err != nil {
+			return f, err
+		}
+		f.routes = append(f.routes, r)
+	}
+	if f.clusters, err = decodeAll(in.Clusters, func() proto.Message { return &cluster.Cluster{} }); err != nil {
+		return f, err
+	}
+	if f.listeners, err = decodeAll(in.Listeners, func() proto.Message { return &listener.Listener{} }); err != nil {
+		return f, err
+	}
+	f.endpoints, err = decodeAll(in.Endpoints, func() proto.Message { return &endpoint.ClusterLoadAssignment{} })
+	return f, err
+}
+
+// decodeAll turns each YAML item into a new proto from newMsg and checks Envoy's field rules.
+func decodeAll(items []any, newMsg func() proto.Message) ([]types.Resource, error) {
+	var out []types.Resource
+	for _, item := range items {
+		m := newMsg()
+		if err := decode(item, m); err != nil {
+			return nil, err
+		}
+		if err := m.(interface{ ValidateAll() error }).ValidateAll(); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
+// decode turns one YAML item into an Envoy proto: YAML -> JSON -> proto.
+func decode(item any, msg proto.Message) error {
+	js, err := json.Marshal(item)
+	if err != nil {
+		return err
+	}
+	return protojson.Unmarshal(js, msg)
 }

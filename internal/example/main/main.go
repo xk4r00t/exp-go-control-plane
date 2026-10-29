@@ -18,6 +18,8 @@ import (
 	"context"
 	"flag"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/envoyproxy/go-control-plane/internal/example"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/v3"
@@ -43,25 +45,49 @@ func init() {
 	flag.StringVar(&nodeID, "nodeID", "test-id", "Node ID")
 }
 
+// push builds snapshot `version` (rewriting example.ConfigFile) and puts it in the cache.
+// The cache then sends it to every Envoy connected with nodeID.
+func push(c cache.SnapshotCache, version int) error {
+	snapshot, err := example.GenerateSnapshot(strconv.Itoa(version))
+	if err != nil {
+		return err
+	}
+	if err := snapshot.Consistent(); err != nil {
+		return err
+	}
+	l.Infof("push v%d from %s", version, example.SourceFile)
+	return c.SetSnapshot(context.Background(), nodeID, snapshot)
+}
+
 func main() {
 	flag.Parse()
 
 	// Create a cache
 	cache := cache.NewSnapshotCache(false, cache.IDHash{}, l)
 
-	// Create the snapshot that we'll serve to Envoy
-	snapshot := example.GenerateSnapshot()
-	if err := snapshot.Consistent(); err != nil {
-		l.Errorf("snapshot inconsistency: %+v\n%+v", snapshot, err)
+	// Push the first snapshot
+	version := 1
+	if err := push(cache, version); err != nil {
+		l.Errorf("snapshot error: %v", err)
 		os.Exit(1)
 	}
-	l.Debugf("will serve snapshot %+v", snapshot)
 
-	// Add the snapshot to the cache
-	if err := cache.SetSnapshot(context.Background(), nodeID, snapshot); err != nil {
-		l.Errorf("snapshot error %q for %+v", err, snapshot)
-		os.Exit(1)
-	}
+	// Push again when the file changes; a new version makes Envoy fetch it
+	go func() {
+		last := time.Now()
+		for range time.Tick(2 * time.Second) {
+			st, err := os.Stat(example.SourceFile)
+			if err != nil || !st.ModTime().After(last) {
+				continue
+			}
+			last = st.ModTime()
+			if err := push(cache, version+1); err != nil {
+				l.Errorf("not pushed, Envoy keeps v%d: %v", version, err)
+				continue
+			}
+			version++
+		}
+	}()
 
 	// Run the xDS server
 	ctx := context.Background()
